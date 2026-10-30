@@ -349,7 +349,7 @@ export default function ManagementDashboard() {
       return { lastMaintained: '4 months ago', knownIssue: 'Broken Part' };
     }
     const openTicket = assetTickets.tickets.find(
-      (t) => t.status !== 'APPROVED' && t.status !== 'REJECTED'
+      (t) => t.status !== 'APPROVED' && t.status !== 'CANCELLED'
     );
     const latestTicket = assetTickets.tickets[0];
     const diffDays = Math.max(

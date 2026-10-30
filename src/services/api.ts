@@ -1,3 +1,5 @@
+import { getAuthToken } from './authStorage';
+
 const configuredApiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
 const apiBaseUrl = import.meta.env.DEV ? '' : configuredApiBaseUrl;
 
@@ -12,12 +14,7 @@ export const resolveMediaUrl = (path: string | null | undefined) => {
   return apiUrl(path);
 };
 
-const getStoredToken = () => {
-  if (typeof localStorage === 'undefined') return null;
-  return localStorage.getItem('prism_token') ||
-    localStorage.getItem('prism_jwt_token') ||
-    localStorage.getItem('token');
-};
+const getStoredToken = () => getAuthToken();
 
 export const fetchApi = async <T,>(
   endpoint: string,

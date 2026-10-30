@@ -3,6 +3,7 @@ import type { ChangeEvent, CSSProperties, FormEvent, MouseEvent as ReactMouseEve
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 import { fetchApi, resolveMediaUrl } from '../services/api';
+import { getStoredUser, isManagementRole } from '../config/roles';
 import {
   ArrowLeft,
   CalendarDays,
@@ -139,17 +140,28 @@ interface TicketDetails {
   description: string;
   created_at: string;
   updated_at: string;
-  assigned_group_id?: string | null;
-  assigned_worker_id?: string | null;
+  maintenance_group_id?: string | null;
+  maintenance_group_name?: string | null;
+  maintenance_group_code?: string | null;
+  acknowledged_at?: string | null;
+  completed_at?: string | null;
+  reopen_count?: number;
   resolution_notes?: string | null;
   rejection_reason?: string | null;
+  auditLogs?: Array<{ action_type: string; notes?: string | null; logged_at: string }>;
 }
 
-type AssetTicket = Pick<TicketDetails, 'id' | 'ticket_number' | 'category' | 'priority' | 'status' | 'description' | 'created_at' | 'updated_at'>;
+type AssetTicket = Pick<TicketDetails, 'id' | 'ticket_number' | 'category' | 'priority' | 'status' | 'description' | 'created_at' | 'updated_at' | 'maintenance_group_name'>;
 
 interface AssetTicketsResponse {
   count: number;
   tickets: AssetTicket[];
+}
+
+interface MaintenanceGroupOption {
+  id: string;
+  name: string;
+  group_code: string;
 }
 
 interface PanoramaPoint {
@@ -229,6 +241,10 @@ export default function AssetDigitalTwinPage() {
   const [ticketCategory, setTicketCategory] = useState('');
   const [ticketPriority, setTicketPriority] = useState('MEDIUM');
   const [ticketDescription, setTicketDescription] = useState('');
+  const [ticketGroupId, setTicketGroupId] = useState('');
+  const [ticketActionBusy, setTicketActionBusy] = useState(false);
+  const [managementReason, setManagementReason] = useState('');
+  const [managementGroupId, setManagementGroupId] = useState('');
   const [ticketEvidence, setTicketEvidence] = useState<TicketEvidence | null>(null);
   const [evidenceState, setEvidenceState] = useState<'idle' | 'capturing' | 'ready' | 'removed' | 'unavailable'>('idle');
   const [evidenceError, setEvidenceError] = useState('');
@@ -273,6 +289,14 @@ export default function AssetDigitalTwinPage() {
     queryFn: () => fetchApi(`/api/tickets/${encodeURIComponent(selectedTicketId)}`),
     enabled: modal === 'issue' && !!selectedTicketId,
   });
+  const availableGroupsQuery = useQuery<{ groups: MaintenanceGroupOption[] }>({
+    queryKey: ['availableGroups', assetId],
+    queryFn: () => fetchApi(`/api/maintenance-groups/available?assetId=${encodeURIComponent(assetId)}`),
+    enabled: (modal === 'ticket' || modal === 'issue') && !!assetId,
+    staleTime: 60 * 1000,
+  });
+  const availableGroups = availableGroupsQuery.data?.groups || [];
+  const managementUser = isManagementRole(getStoredUser()?.role);
   const siteAssetsQuery = useQuery<SiteAssetsResponse>({
     queryKey: ['siteAssets', twin?.site.id],
     queryFn: () => fetchApi(`/api/sites/${encodeURIComponent(twin!.site.id)}/assets`),
@@ -488,6 +512,10 @@ export default function AssetDigitalTwinPage() {
       setOperationError('Enter both a problem category and description.');
       return;
     }
+    if (!ticketGroupId) {
+      setOperationError('Select the maintenance group responsible for this ticket.');
+      return;
+    }
 
     ticketSubmissionInFlight.current = true;
     setTicketSubmitting(true);
@@ -495,6 +523,7 @@ export default function AssetDigitalTwinPage() {
     try {
       const formData = new FormData();
       formData.append('assetId', twin.asset.id);
+      formData.append('groupId', ticketGroupId);
       formData.append('category', category);
       formData.append('priority', ticketPriority);
       formData.append('description', description);
@@ -515,6 +544,7 @@ export default function AssetDigitalTwinPage() {
       setTicketCategory('');
       setTicketPriority('MEDIUM');
       setTicketDescription('');
+      setTicketGroupId('');
       replaceTicketEvidence(null);
       setEvidenceState('idle');
       setEvidenceError('');
@@ -570,6 +600,79 @@ export default function AssetDigitalTwinPage() {
   const validation = capture?.hotspotValidation;
   const currentCapture = timeline.find((item) => item.captureId === capture?.id);
   const ticketDetails = issueQuery.data;
+  const lastRejection = [...(ticketDetails?.auditLogs || [])]
+    .reverse()
+    .find((entry) => entry.action_type === 'MANAGEMENT_REJECTED')?.notes || ticketDetails?.rejection_reason;
+
+  const runTicketAction = async (
+    endpoint: string,
+    init: RequestInit,
+    successMessage: string
+  ) => {
+    if (ticketActionBusy || !selectedTicketId) return;
+    setTicketActionBusy(true);
+    setOperationError('');
+    try {
+      await fetchApi(endpoint, init);
+      setOperationNotice(successMessage);
+      setManagementReason('');
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ['ticket', selectedTicketId] }),
+        queryClient.invalidateQueries({ queryKey: ['assetTickets', assetId] }),
+        queryClient.invalidateQueries({ queryKey: ['digitalTwin', assetId] }),
+      ]);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'Ticket action failed.');
+    } finally {
+      setTicketActionBusy(false);
+    }
+  };
+
+  const verifySelectedTicket = (approved: boolean) => {
+    if (!approved && !managementReason.trim()) {
+      setOperationError('A rejection reason is required.');
+      return;
+    }
+    return runTicketAction(
+      `/api/tickets/${encodeURIComponent(selectedTicketId)}/verify`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ approved, rejectionReason: approved ? null : managementReason })
+      },
+      approved ? 'Ticket approved.' : 'Ticket rejected and returned to in progress.'
+    );
+  };
+
+  const cancelSelectedTicket = () => {
+    if (!managementReason.trim()) {
+      setOperationError('A cancellation reason is required.');
+      return;
+    }
+    return runTicketAction(
+      `/api/tickets/${encodeURIComponent(selectedTicketId)}/cancel`,
+      { method: 'PATCH', body: JSON.stringify({ reason: managementReason }) },
+      'Ticket cancelled.'
+    );
+  };
+
+  const reopenSelectedTicket = () => {
+    if (!managementGroupId) {
+      setOperationError('Select a maintenance group to reopen the ticket.');
+      return;
+    }
+    if (!managementReason.trim()) {
+      setOperationError('A reopen reason is required.');
+      return;
+    }
+    return runTicketAction(
+      `/api/tickets/${encodeURIComponent(selectedTicketId)}/reopen`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ groupId: managementGroupId, reason: managementReason })
+      },
+      'Ticket reopened and assigned to the selected group.'
+    );
+  };
 
   return (
     <div style={styles.page} className="digital-twin-page">
@@ -914,6 +1017,29 @@ export default function AssetDigitalTwinPage() {
                       <h3 id="ticket-problem-heading" style={styles.ticketSectionTitle}>Problem details</h3>
                     </div>
                     <label style={styles.formField}>
+                      <span>Maintenance group <span style={styles.requiredMark}>Required</span></span>
+                      <select
+                        value={ticketGroupId}
+                        onChange={(event) => { setTicketGroupId(event.target.value); setOperationError(''); }}
+                        required
+                        disabled={ticketSubmitting || availableGroupsQuery.isLoading}
+                        style={styles.formInput}
+                      >
+                        <option value="">
+                          {availableGroupsQuery.isLoading
+                            ? 'Loading groups…'
+                            : availableGroups.length
+                              ? 'Select the responsible group'
+                              : 'No contracted groups available'}
+                        </option>
+                        {availableGroups.map((group) => (
+                          <option key={group.id} value={group.id}>
+                            {group.name} ({group.group_code})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={styles.formField}>
                       <span>Problem category <span style={styles.requiredMark}>Required</span></span>
                       <input
                         value={ticketCategory}
@@ -1044,10 +1170,55 @@ export default function AssetDigitalTwinPage() {
                 <DetailRow label="Status"><span style={{ ...styles.statusChip, ...statusColor(ticketDetails?.status || selectedTicket?.status || 'OPEN') }}>{statusLabel(ticketDetails?.status || selectedTicket?.status || 'OPEN')}</span></DetailRow>
                 <DetailRow label="Category"><span style={styles.metadataValue}>{ticketDetails?.category || selectedTicket?.category || 'Not available'}</span></DetailRow>
                 <DetailRow label="Priority"><span style={styles.metadataValue}>{ticketDetails?.priority || selectedTicket?.priority || 'Not available'}</span></DetailRow>
+                <DetailRow label="Maintenance group"><span style={styles.metadataValue}>{ticketDetails?.maintenance_group_name || 'Unassigned'}{ticketDetails?.maintenance_group_code ? ` (${ticketDetails.maintenance_group_code})` : ''}</span></DetailRow>
                 <DetailRow label="Reported"><span style={styles.metadataValue}>{formatDate(ticketDetails?.created_at || selectedTicket?.created_at)}</span></DetailRow>
+                {ticketDetails?.acknowledged_at && <DetailRow label="Acknowledged"><span style={styles.metadataValue}>{formatDate(ticketDetails.acknowledged_at)}</span></DetailRow>}
+                {ticketDetails?.completed_at && <DetailRow label="Completed"><span style={styles.metadataValue}>{formatDate(ticketDetails.completed_at)}</span></DetailRow>}
+                {ticketDetails?.reopen_count ? <DetailRow label="Reopened"><span style={styles.metadataValue}>{ticketDetails.reopen_count} time(s)</span></DetailRow> : null}
                 <div style={styles.issueDescription}>{ticketDetails?.description || selectedTicket?.description || 'Loading ticket description…'}</div>
                 {ticketDetails?.resolution_notes && <div style={styles.issueDescription}><strong>Resolution:</strong> {ticketDetails.resolution_notes}</div>}
-                {ticketDetails?.rejection_reason && <div style={styles.issueDescription}><strong>Rejection reason:</strong> {ticketDetails.rejection_reason}</div>}
+                {lastRejection && <div style={styles.issueDescription}><strong>Last rejection reason:</strong> {lastRejection}</div>}
+                {managementUser && ticketDetails && (
+                  <div style={styles.managementPanel}>
+                    <h3 style={styles.managementTitle}>Management actions</h3>
+                    {['PENDING_VERIFICATION', 'ASSIGNED', 'ACKNOWLEDGED', 'IN_PROGRESS'].includes(ticketDetails.status) && (
+                      <textarea
+                        value={managementReason}
+                        onChange={(event) => { setManagementReason(event.target.value); setOperationError(''); }}
+                        placeholder="Reason (required for rejection, cancellation, or reopen)"
+                        style={styles.managementTextarea}
+                        disabled={ticketActionBusy}
+                      />
+                    )}
+                    <div style={styles.managementActions}>
+                      {ticketDetails.status === 'PENDING_VERIFICATION' && (
+                        <>
+                          <button type="button" style={styles.managementPrimary} onClick={() => void verifySelectedTicket(true)} disabled={ticketActionBusy}>Approve</button>
+                          <button type="button" style={styles.managementDanger} onClick={() => void verifySelectedTicket(false)} disabled={ticketActionBusy}>Reject</button>
+                        </>
+                      )}
+                      {['ASSIGNED', 'ACKNOWLEDGED', 'IN_PROGRESS', 'PENDING_VERIFICATION'].includes(ticketDetails.status) && (
+                        <button type="button" style={styles.managementDanger} onClick={() => void cancelSelectedTicket()} disabled={ticketActionBusy}>Cancel ticket</button>
+                      )}
+                      {['APPROVED', 'CANCELLED'].includes(ticketDetails.status) && (
+                        <>
+                          <select
+                            value={managementGroupId}
+                            onChange={(event) => { setManagementGroupId(event.target.value); setOperationError(''); }}
+                            style={styles.managementSelect}
+                            disabled={ticketActionBusy}
+                          >
+                            <option value="">Select group to reopen</option>
+                            {availableGroups.map((group) => (
+                              <option key={group.id} value={group.id}>{group.name} ({group.group_code})</option>
+                            ))}
+                          </select>
+                          <button type="button" style={styles.managementPrimary} onClick={() => void reopenSelectedTicket()} disabled={ticketActionBusy}>Reopen ticket</button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {issueQuery.isLoading && <span style={styles.loadingInline}>Loading ticket details…</span>}
                 {issueQuery.isError && <span style={styles.formError}>Full ticket details unavailable. Showing the saved summary.</span>}
               </div>
@@ -1081,7 +1252,9 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }) 
 function statusColor(status: string): CSSProperties {
   const value = status.toUpperCase();
   if (value === 'CLEAR' || value === 'APPROVED') return { color: '#86efac', backgroundColor: 'rgba(34, 197, 94, 0.14)', borderColor: 'rgba(34, 197, 94, 0.25)' };
-  if (value === 'IN_PROGRESS' || value === 'ASSIGNED') return { color: '#93c5fd', backgroundColor: 'rgba(59, 130, 246, 0.14)', borderColor: 'rgba(59, 130, 246, 0.25)' };
+  if (value === 'IN_PROGRESS' || value === 'ASSIGNED' || value === 'ACKNOWLEDGED') return { color: '#93c5fd', backgroundColor: 'rgba(59, 130, 246, 0.14)', borderColor: 'rgba(59, 130, 246, 0.25)' };
+  if (value === 'PENDING_VERIFICATION') return { color: '#fcd34d', backgroundColor: 'rgba(245, 158, 11, 0.16)', borderColor: 'rgba(245, 158, 11, 0.3)' };
+  if (value === 'CANCELLED') return { color: '#cbd5e1', backgroundColor: 'rgba(148, 163, 184, 0.16)', borderColor: 'rgba(148, 163, 184, 0.3)' };
   return { color: '#fda4af', backgroundColor: 'rgba(244, 63, 94, 0.14)', borderColor: 'rgba(244, 63, 94, 0.25)' };
 }
 
@@ -1396,6 +1569,13 @@ const PanoramaViewer = forwardRef<PanoramaViewerHandle, PanoramaViewerProps>(fun
 });
 
 const styles: Record<string, CSSProperties> = {
+  managementPanel: { marginTop: '16px', padding: '14px', borderRadius: '10px', border: '1px solid #334155', backgroundColor: 'rgba(15, 23, 42, 0.7)' },
+  managementTitle: { margin: '0 0 10px', fontSize: '14px', color: '#cbd5e1' },
+  managementTextarea: { width: '100%', minHeight: '70px', padding: '10px 12px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#e2e8f0', boxSizing: 'border-box', fontFamily: 'inherit' },
+  managementActions: { display: 'flex', flexWrap: 'wrap', gap: '10px', marginTop: '10px', alignItems: 'center' },
+  managementPrimary: { padding: '9px 14px', borderRadius: '8px', border: 'none', backgroundColor: '#2563eb', color: '#fff', cursor: 'pointer' },
+  managementDanger: { padding: '9px 14px', borderRadius: '8px', border: 'none', backgroundColor: '#dc2626', color: '#fff', cursor: 'pointer' },
+  managementSelect: { padding: '9px 12px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#e2e8f0' },
   page: {
     position: 'fixed',
     inset: 0,

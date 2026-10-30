@@ -1,8 +1,12 @@
 import React, { useState, useEffect, memo } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import CyberGridBackground from '../components/CyberGridBackground';
 import AppleGlassCard from '../components/AppleGlassCard';
 import { fetchApi } from '../services/api';
+import { setAuthSession } from '../services/authStorage';
+import { isManagementRole } from '../config/roles';
+import type { StoredUser } from '../config/roles';
 
 // Memoized so typing in form inputs never re-triggers or re-renders the HUD text
 const ScrambleText = memo(function ScrambleText({ targetText }: { targetText: string }) {
@@ -62,6 +66,7 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,16 +79,20 @@ export default function LoginPage() {
         body: JSON.stringify({ email, password }),
       }, null);
 
-      localStorage.setItem('prism_token', data.token);
-
-      const { user } = await fetchApi<{ user: { userId: string; email: string; role: string } }>(
+      // Resolve the identity before persisting anything, so a failed /me call
+      // never leaves a half-written session behind.
+      const { user } = await fetchApi<{ user: StoredUser }>(
         '/api/identity/me',
         {},
         data.token
       );
-      localStorage.setItem('prism_user', JSON.stringify(user));
 
-      if (user.role === 'Council Admin' || user.role === 'COUNCIL_ADMIN') {
+      // Session is scoped to this tab only (sessionStorage), and any cached
+      // data from a previous account in this tab is discarded.
+      setAuthSession(data.token, user);
+      queryClient.clear();
+
+      if (isManagementRole(user.role)) {
         navigate('/management/dashboard');
       } else {
         navigate('/maintenance/dashboard');

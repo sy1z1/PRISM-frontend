@@ -5,7 +5,7 @@ import CyberGridBackground from '../components/CyberGridBackground';
 import AppleGlassCard from '../components/AppleGlassCard';
 import { fetchApi } from '../services/api';
 import { setAuthSession } from '../services/authStorage';
-import { isManagementRole } from '../config/roles';
+import { defaultRouteFor } from '../config/roles';
 import type { StoredUser } from '../config/roles';
 
 // Memoized so typing in form inputs never re-triggers or re-renders the HUD text
@@ -91,12 +91,7 @@ export default function LoginPage() {
       // data from a previous account in this tab is discarded.
       setAuthSession(data.token, user);
       queryClient.clear();
-
-      if (isManagementRole(user.role)) {
-        navigate('/management/dashboard');
-      } else {
-        navigate('/maintenance/dashboard');
-      }
+      navigate(defaultRouteFor(user.role));
     } catch (err: any) {
       setError(err.message || 'An error occurred during login.');
     } finally {

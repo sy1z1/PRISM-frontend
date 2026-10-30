@@ -2,7 +2,8 @@ import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState }
 import type { ChangeEvent, CSSProperties, FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
-import { fetchApi, resolveMediaUrl } from '../services/api';
+import { fetchApi } from '../services/api';
+import { SecureMedia, SecureMediaLink, useSecureMedia } from '../components/SecureMedia';
 import { getStoredUser, isManagementRole } from '../config/roles';
 import {
   ArrowLeft,
@@ -143,12 +144,23 @@ interface TicketDetails {
   maintenance_group_id?: string | null;
   maintenance_group_name?: string | null;
   maintenance_group_code?: string | null;
+  organization_id?: string | null;
+  organization_name?: string | null;
   acknowledged_at?: string | null;
+  acknowledged_by_email?: string | null;
   completed_at?: string | null;
+  completed_by_email?: string | null;
+  verified_by_email?: string | null;
   reopen_count?: number;
   resolution_notes?: string | null;
   rejection_reason?: string | null;
-  auditLogs?: Array<{ action_type: string; notes?: string | null; logged_at: string }>;
+  media?: Array<{
+    id: string;
+    media_url: string;
+    evidence_stage: string;
+    created_at: string;
+  }>;
+  auditLogs?: Array<{ action_type: string; notes?: string | null; logged_at: string; actor_email?: string | null }>;
 }
 
 type AssetTicket = Pick<TicketDetails, 'id' | 'ticket_number' | 'category' | 'priority' | 'status' | 'description' | 'created_at' | 'updated_at' | 'maintenance_group_name'>;
@@ -277,6 +289,7 @@ export default function AssetDigitalTwinPage() {
     enabled: !!assetId,
   });
   const twin = digitalTwinQuery.data;
+  const activeCaptureImage = useSecureMedia(twin?.activeCapture?.image360Url);
   const activeIssue = twin?.activeIssue;
   const existingTicketsQuery = useQuery<AssetTicketsResponse>({
     queryKey: ['assetTickets', assetId],
@@ -620,6 +633,10 @@ export default function AssetDigitalTwinPage() {
         queryClient.invalidateQueries({ queryKey: ['ticket', selectedTicketId] }),
         queryClient.invalidateQueries({ queryKey: ['assetTickets', assetId] }),
         queryClient.invalidateQueries({ queryKey: ['digitalTwin', assetId] }),
+        queryClient.invalidateQueries({ queryKey: ['macro'] }),
+        queryClient.invalidateQueries({ queryKey: ['siteAssets'] }),
+        queryClient.invalidateQueries({ queryKey: ['managementQueue'] }),
+        queryClient.invalidateQueries({ queryKey: ['managementQueueCount'] }),
       ]);
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : 'Ticket action failed.');
@@ -652,6 +669,18 @@ export default function AssetDigitalTwinPage() {
       `/api/tickets/${encodeURIComponent(selectedTicketId)}/cancel`,
       { method: 'PATCH', body: JSON.stringify({ reason: managementReason }) },
       'Ticket cancelled.'
+    );
+  };
+
+  const reassignSelectedTicket = () => {
+    if (!managementGroupId) {
+      setOperationError('Select a maintenance group to reassign the ticket.');
+      return;
+    }
+    return runTicketAction(
+      `/api/tickets/${encodeURIComponent(selectedTicketId)}/assign`,
+      { method: 'POST', body: JSON.stringify({ groupId: managementGroupId }) },
+      'Ticket reassigned.'
     );
   };
 
@@ -810,7 +839,7 @@ export default function AssetDigitalTwinPage() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept="image/jpeg,image/png,image/webp"
           onChange={handleUploadCapture}
           style={{ display: 'none' }}
           aria-label="Upload 360 capture"
@@ -825,16 +854,25 @@ export default function AssetDigitalTwinPage() {
 
         <div style={styles.viewerCanvas}>
           {capture?.image360Url ? (
-            <PanoramaViewer
-              ref={panoramaRef}
-              key={`${twin.asset.id}:${capture.id}`}
-              imageUrl={resolveMediaUrl(capture.image360Url)}
-              hotspots={showHotspots ? capture.hotspots : []}
-              tool={tool}
-              busy={savingHotspot}
-              onHotspotClick={isRetakingEvidence ? () => undefined : navigateToAsset}
-              onPlaceHotspot={handlePlaceHotspot}
-            />
+            activeCaptureImage.url ? (
+              <PanoramaViewer
+                ref={panoramaRef}
+                key={`${twin.asset.id}:${capture.id}`}
+                imageUrl={activeCaptureImage.url}
+                hotspots={showHotspots ? capture.hotspots : []}
+                tool={tool}
+                busy={savingHotspot}
+                onHotspotClick={isRetakingEvidence ? () => undefined : navigateToAsset}
+                onPlaceHotspot={handlePlaceHotspot}
+              />
+            ) : (
+              <div style={styles.emptyPanorama}>
+                <Camera size={38} strokeWidth={1.3} />
+                <h2 style={styles.emptyTitle}>
+                  {activeCaptureImage.error ? '360° capture unavailable' : 'Loading 360° capture…'}
+                </h2>
+              </div>
+            )
           ) : (
             <div style={styles.emptyPanorama}>
               <Camera size={38} strokeWidth={1.3} />
@@ -1171,12 +1209,37 @@ export default function AssetDigitalTwinPage() {
                 <DetailRow label="Category"><span style={styles.metadataValue}>{ticketDetails?.category || selectedTicket?.category || 'Not available'}</span></DetailRow>
                 <DetailRow label="Priority"><span style={styles.metadataValue}>{ticketDetails?.priority || selectedTicket?.priority || 'Not available'}</span></DetailRow>
                 <DetailRow label="Maintenance group"><span style={styles.metadataValue}>{ticketDetails?.maintenance_group_name || 'Unassigned'}{ticketDetails?.maintenance_group_code ? ` (${ticketDetails.maintenance_group_code})` : ''}</span></DetailRow>
+                <DetailRow label="Organization"><span style={styles.metadataValue}>{ticketDetails?.organization_name || 'Not available'}</span></DetailRow>
                 <DetailRow label="Reported"><span style={styles.metadataValue}>{formatDate(ticketDetails?.created_at || selectedTicket?.created_at)}</span></DetailRow>
                 {ticketDetails?.acknowledged_at && <DetailRow label="Acknowledged"><span style={styles.metadataValue}>{formatDate(ticketDetails.acknowledged_at)}</span></DetailRow>}
                 {ticketDetails?.completed_at && <DetailRow label="Completed"><span style={styles.metadataValue}>{formatDate(ticketDetails.completed_at)}</span></DetailRow>}
                 {ticketDetails?.reopen_count ? <DetailRow label="Reopened"><span style={styles.metadataValue}>{ticketDetails.reopen_count} time(s)</span></DetailRow> : null}
                 <div style={styles.issueDescription}>{ticketDetails?.description || selectedTicket?.description || 'Loading ticket description…'}</div>
                 {ticketDetails?.resolution_notes && <div style={styles.issueDescription}><strong>Resolution:</strong> {ticketDetails.resolution_notes}</div>}
+                {ticketDetails?.acknowledged_by_email && <DetailRow label="Acknowledged by"><span style={styles.metadataValue}>{ticketDetails.acknowledged_by_email}</span></DetailRow>}
+                {ticketDetails?.completed_by_email && <DetailRow label="Completed by"><span style={styles.metadataValue}>{ticketDetails.completed_by_email}</span></DetailRow>}
+                {ticketDetails?.verified_by_email && <DetailRow label="Verified by"><span style={styles.metadataValue}>{ticketDetails.verified_by_email}</span></DetailRow>}
+                {ticketDetails?.media?.length ? (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#64748b' }}>Evidence</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                      {ticketDetails.media?.map((media) => (
+                        <SecureMediaLink
+                          key={media.id}
+                          path={media.media_url}
+                          style={{ display: 'flex', flexDirection: 'column', gap: 4, color: '#94a3b8', fontSize: 11 }}
+                        >
+                          <SecureMedia
+                            path={media.media_url}
+                            alt={`${media.evidence_stage} evidence`}
+                            style={{ width: 110, height: 80, objectFit: 'cover', borderRadius: 8, border: '1px solid rgba(148,163,184,0.25)' }}
+                          />
+                          <span>{media.evidence_stage}</span>
+                        </SecureMediaLink>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 {lastRejection && <div style={styles.issueDescription}><strong>Last rejection reason:</strong> {lastRejection}</div>}
                 {managementUser && ticketDetails && (
                   <div style={styles.managementPanel}>
@@ -1191,6 +1254,22 @@ export default function AssetDigitalTwinPage() {
                       />
                     )}
                     <div style={styles.managementActions}>
+                      {['OPEN', 'ASSIGNED', 'ACKNOWLEDGED'].includes(ticketDetails.status) && (
+                        <>
+                          <select
+                            value={managementGroupId}
+                            onChange={(event) => { setManagementGroupId(event.target.value); setOperationError(''); }}
+                            style={styles.managementSelect}
+                            disabled={ticketActionBusy}
+                          >
+                            <option value="">Select group to reassign</option>
+                            {availableGroups.map((group) => (
+                              <option key={group.id} value={group.id}>{group.name} ({group.group_code})</option>
+                            ))}
+                          </select>
+                          <button type="button" style={styles.managementPrimary} onClick={() => void reassignSelectedTicket()} disabled={ticketActionBusy || !managementGroupId}>Reassign</button>
+                        </>
+                      )}
                       {ticketDetails.status === 'PENDING_VERIFICATION' && (
                         <>
                           <button type="button" style={styles.managementPrimary} onClick={() => void verifySelectedTicket(true)} disabled={ticketActionBusy}>Approve</button>

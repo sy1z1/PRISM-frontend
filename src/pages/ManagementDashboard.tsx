@@ -3,11 +3,14 @@ import { Outlet, useNavigate } from 'react-router-dom';
 import Map, { Marker, Source, Layer } from 'react-map-gl/mapbox';
 import type { MapRef, LayerProps } from 'react-map-gl/mapbox';
 import type { Geometry, Feature, FeatureCollection } from 'geojson';
-import { useQuery } from '@tanstack/react-query';
-import { Bell, Settings, User, Menu, Plus, Minus, Wrench, Calendar, AlertCircle, Sparkles, ArrowLeft } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Bell, Settings, User, Menu, Plus, Minus, Wrench, Calendar, AlertCircle, Sparkles, ArrowLeft, ClipboardList, Building2, FileBarChart } from 'lucide-react';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import AppleGlassCard from '../components/AppleGlassCard';
-import { fetchApi, resolveMediaUrl } from '../services/api';
+import { SecureMedia } from '../components/SecureMedia';
+import { fetchApi } from '../services/api';
+import { clearAuthSession } from '../services/authStorage';
+import { getStoredUser, isManagementRole } from '../config/roles';
 import { mapboxAccessToken } from '../services/config';
 
 // ==========================================
@@ -111,6 +114,7 @@ const parseGeoJSON = (
 export default function ManagementDashboard() {
   const mapRef = useRef<MapRef | null>(null);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   // View State: 'MACRO' (Region level) vs 'MICRO' (Site/Playground level)
   const [viewMode, setViewMode] = useState<'MACRO' | 'MICRO'>('MACRO');
@@ -169,6 +173,17 @@ export default function ManagementDashboard() {
     enabled: !!selectedAsset?.id,
     staleTime: 60 * 1000,
   });
+
+  // Management-only pending-verification badge (D4: 60s polling).
+  const canUseManagementQueue = isManagementRole(getStoredUser()?.role);
+  const pendingVerificationQuery = useQuery<{ total: number }>({
+    queryKey: ['managementQueueCount', 'PENDING_VERIFICATION'],
+    queryFn: () => fetchApi('/api/tickets/queue?status=PENDING_VERIFICATION&limit=1'),
+    enabled: canUseManagementQueue,
+    refetchInterval: 60_000,
+    staleTime: 15_000,
+  });
+  const pendingVerificationCount = pendingVerificationQuery.data?.total || 0;
 
   // ------------------------------------------
   // MAP CAMERA & INTERACTION HANDLERS
@@ -346,7 +361,7 @@ export default function ManagementDashboard() {
   // Derived Asset Details from Ticket History
   const assetTicketMeta = useMemo(() => {
     if (!assetTickets?.tickets?.length) {
-      return { lastMaintained: '4 months ago', knownIssue: 'Broken Part' };
+      return { lastMaintained: 'No maintenance history', knownIssue: null };
     }
     const openTicket = assetTickets.tickets.find(
       (t) => t.status !== 'APPROVED' && t.status !== 'CANCELLED'
@@ -361,7 +376,7 @@ export default function ManagementDashboard() {
 
     return {
       lastMaintained: lastMaintainedStr,
-      knownIssue: openTicket?.description || openTicket?.category || 'Broken Part',
+      knownIssue: openTicket?.description || openTicket?.category || null,
     };
   }, [assetTickets]);
 
@@ -626,13 +641,80 @@ export default function ManagementDashboard() {
           style={{ padding: '10px 18px', borderRadius: '14px' }}
         >
           <div style={styles.actionIconsRow}>
+            {canUseManagementQueue && (
+              <button
+                style={{ ...styles.iconBtn, position: 'relative' }}
+                aria-label="Maintenance tickets"
+                title="Maintenance tickets"
+                onClick={() => navigate('/management/tickets')}
+              >
+                <ClipboardList size={19} color="#f8fafc" />
+                {pendingVerificationCount > 0 && (
+                  <span
+                    style={{
+                      position: 'absolute',
+                      top: -4,
+                      right: -4,
+                      minWidth: 16,
+                      height: 16,
+                      borderRadius: 999,
+                      background: '#ef4444',
+                      color: '#fff',
+                      fontSize: 10,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      padding: '0 4px',
+                      fontWeight: 700
+                    }}
+                  >
+                    {pendingVerificationCount}
+                  </span>
+                )}
+              </button>
+            )}
+            {canUseManagementQueue && (
+              <button
+                style={styles.iconBtn}
+                aria-label="Contracted groups"
+                title="Contracted groups"
+                onClick={() => navigate('/management/contractors')}
+              >
+                <Building2 size={19} color="#f8fafc" />
+              </button>
+            )}
+            {canUseManagementQueue && (
+              <button
+                style={styles.iconBtn}
+                aria-label="Reports"
+                title="Reports"
+                onClick={() => navigate('/reports')}
+              >
+                <FileBarChart size={19} color="#f8fafc" />
+              </button>
+            )}
             <button style={styles.iconBtn} aria-label="Notifications">
               <Bell size={19} color="#f8fafc" />
             </button>
             <button style={styles.iconBtn} aria-label="Settings">
               <Settings size={19} color="#f8fafc" />
             </button>
-            <button style={styles.iconBtn} aria-label="User Profile">
+            <button
+              style={styles.iconBtn}
+              aria-label="Sign out"
+              title="Sign out"
+              onClick={async () => {
+                try {
+                  await fetchApi('/api/identity/logout', { method: 'POST' });
+                } catch {
+                  // Session may already be invalid.
+                } finally {
+                  clearAuthSession();
+                  queryClient.clear();
+                  navigate('/login', { replace: true });
+                }
+              }}
+            >
               <User size={19} color="#f8fafc" />
             </button>
           </div>
@@ -649,14 +731,17 @@ export default function ManagementDashboard() {
             style={{ padding: '0px', borderRadius: '16px', overflow: 'hidden' }}
           >
             <div style={styles.assetImageContainer}>
-              <img
-                src={
-                  selectedAsset.imageUrl
-                    ? resolveMediaUrl(selectedAsset.imageUrl)
-                    : 'https://images.unsplash.com/photo-1596464716127-f2a82984de30?auto=format&fit=crop&w=600&q=80'
-                }
+              <SecureMedia
+                path={selectedAsset.imageUrl}
                 alt={selectedAsset.name}
                 style={styles.assetImage}
+                fallback={
+                  <img
+                    src="https://images.unsplash.com/photo-1596464716127-f2a82984de30?auto=format&fit=crop&w=600&q=80"
+                    alt={selectedAsset.name}
+                    style={styles.assetImage}
+                  />
+                }
               />
             </div>
 
@@ -689,7 +774,7 @@ export default function ManagementDashboard() {
                 <div style={styles.assetMetaItem}>
                   <Calendar size={13} color="#94a3b8" />
                   <span>
-                    Last Maintained :{' '}
+                    Last Activity :{' '}
                     <strong style={{ color: '#f8fafc' }}>{assetTicketMeta.lastMaintained}</strong>
                   </span>
                 </div>
@@ -698,8 +783,8 @@ export default function ManagementDashboard() {
                   <div style={styles.assetMetaItem}>
                     <AlertCircle size={13} color="#94a3b8" />
                     <span>
-                      Known Issue:{' '}
-                      <strong style={{ color: '#f8fafc' }}>{assetTicketMeta.knownIssue}</strong>
+                    Known Issue:{' '}
+                    <strong style={{ color: '#f8fafc' }}>{assetTicketMeta.knownIssue || 'None reported'}</strong>
                     </span>
                   </div>
                 )}

@@ -44,15 +44,21 @@ export default function SupervisorQueuePage() {
   const [data, setData] = useState<QueueResponse | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [debouncedSearch, setDebouncedSearch] = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError('');
     try {
       const params = new URLSearchParams();
       if (status) params.set('status', status);
       if (priority) params.set('priority', priority);
-      if (search.trim()) params.set('q', search.trim());
+      if (debouncedSearch.trim()) params.set('q', debouncedSearch.trim());
       params.set('page', String(page));
       params.set('limit', '20');
       const result = await fetchApi<QueueResponse>(`/api/tickets/queue?${params.toString()}`);
@@ -60,12 +66,14 @@ export default function SupervisorQueuePage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load the queue.');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  }, [status, priority, search, page]);
+  }, [status, priority, debouncedSearch, page]);
 
   useEffect(() => {
     void load();
+    const timer = setInterval(() => void load(true), 60_000);
+    return () => clearInterval(timer);
   }, [load]);
 
   const signOut = async () => {
@@ -88,10 +96,19 @@ export default function SupervisorQueuePage() {
         <div>
           <h1 style={styles.title}>Maintenance group queue</h1>
           <p style={styles.subtitle}>
-            {user?.email ? `${user.email} · ` : ''}Tickets for your authorized groups
+            {user?.email ? `${user.email} · ` : ''}Tickets for your authorized groups · refreshes every 60s
           </p>
         </div>
-        <button type="button" style={styles.signOut} onClick={signOut}>Sign out</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            type="button"
+            style={{ ...styles.signOut, background: 'rgba(59,130,246,0.12)', borderColor: 'rgba(59,130,246,0.4)', color: '#93c5fd' }}
+            onClick={() => navigate('/reports')}
+          >
+            Reports
+          </button>
+          <button type="button" style={styles.signOut} onClick={signOut}>Sign out</button>
+        </div>
       </header>
 
       <section style={styles.filters}>

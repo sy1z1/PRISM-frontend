@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { fetchApi, resolveMediaUrl } from '../../services/api';
+import { useQueryClient } from '@tanstack/react-query';
+import { fetchApi } from '../../services/api';
+import { SecureMedia, SecureMediaLink } from '../../components/SecureMedia';
 import { getStoredUser, isManagementRole } from '../../config/roles';
 
 interface TicketMedia {
@@ -18,6 +20,7 @@ interface AuditEntry {
   new_value: string | null;
   notes: string | null;
   logged_at: string;
+  actor_email?: string | null;
 }
 
 interface TicketDetail {
@@ -35,6 +38,12 @@ interface TicketDetail {
   maintenance_group_id: string | null;
   maintenance_group_name: string | null;
   maintenance_group_code: string | null;
+  organization_id?: string | null;
+  organization_name?: string | null;
+  reported_by_email?: string | null;
+  acknowledged_by_email?: string | null;
+  completed_by_email?: string | null;
+  verified_by_email?: string | null;
   acknowledged_at: string | null;
   completed_at: string | null;
   reopen_count: number;
@@ -53,6 +62,7 @@ interface GroupOption {
 export default function SupervisorTicketDetailPage() {
   const { ticketId = '' } = useParams<{ ticketId: string }>();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const user = useMemo(() => getStoredUser(), []);
   const management = isManagementRole(user?.role);
 
@@ -61,6 +71,7 @@ export default function SupervisorTicketDetailPage() {
   const [note, setNote] = useState('');
   const [reason, setReason] = useState('');
   const [groupId, setGroupId] = useState('');
+  const [afterFile, setAfterFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -93,9 +104,18 @@ export default function SupervisorTicketDetailPage() {
     setNotice('');
     try {
       await action();
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ['macro'] }),
+        queryClient.invalidateQueries({ queryKey: ['siteAssets'] }),
+        queryClient.invalidateQueries({ queryKey: ['assetTickets'] }),
+        queryClient.invalidateQueries({ queryKey: ['digitalTwin'] }),
+        queryClient.invalidateQueries({ queryKey: ['managementQueue'] }),
+        queryClient.invalidateQueries({ queryKey: ['managementQueueCount'] })
+      ]);
       setNotice(`${label} completed.`);
       setNote('');
       setReason('');
+      setAfterFile(null);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : `${label} failed.`);
@@ -118,10 +138,17 @@ export default function SupervisorTicketDetailPage() {
       setError('Resolution notes are required.');
       return;
     }
+    if (!afterFile) {
+      setError('An AFTER photo is required to complete the ticket.');
+      return;
+    }
+    const form = new FormData();
+    form.append('resolutionNotes', note);
+    form.append('ticketMedia', afterFile);
     return run('Completion', () =>
       fetchApi(`/api/tickets/${encodeURIComponent(ticketId)}/resolve`, {
         method: 'PATCH',
-        body: JSON.stringify({ resolutionNotes: note })
+        body: form
       }));
   };
 
@@ -179,8 +206,12 @@ export default function SupervisorTicketDetailPage() {
 
   return (
     <div style={styles.page}>
-      <button type="button" style={styles.back} onClick={() => navigate('/maintenance/dashboard')}>
-        ← Back to queue
+      <button
+        type="button"
+        style={styles.back}
+        onClick={() => navigate(management ? '/management/tickets' : '/maintenance/dashboard')}
+      >
+        ← {management ? 'Back to tickets' : 'Back to queue'}
       </button>
 
       {error && <div style={styles.error} role="alert">{error}</div>}
@@ -203,11 +234,16 @@ export default function SupervisorTicketDetailPage() {
               {ticket.maintenance_group_name || 'Unassigned'}
               {ticket.maintenance_group_code ? ` (${ticket.maintenance_group_code})` : ''}
             </Row>
+            <Row label="Organization">{ticket.organization_name || '—'}</Row>
             <Row label="Priority">{ticket.priority}</Row>
             <Row label="Category">{ticket.category}</Row>
             <Row label="Reported">{formatDate(ticket.created_at)}</Row>
+            {ticket.reported_by_email && <Row label="Reported by">{ticket.reported_by_email}</Row>}
             {ticket.acknowledged_at && <Row label="Acknowledged">{formatDate(ticket.acknowledged_at)}</Row>}
+            {ticket.acknowledged_by_email && <Row label="Acknowledged by">{ticket.acknowledged_by_email}</Row>}
             {ticket.completed_at && <Row label="Completed">{formatDate(ticket.completed_at)}</Row>}
+            {ticket.completed_by_email && <Row label="Completed by">{ticket.completed_by_email}</Row>}
+            {ticket.verified_by_email && <Row label="Verified by">{ticket.verified_by_email}</Row>}
             {ticket.reopen_count > 0 && <Row label="Reopened">{ticket.reopen_count} time(s)</Row>}
             <div style={styles.description}>{ticket.description}</div>
             {ticket.resolution_notes && (
@@ -220,16 +256,14 @@ export default function SupervisorTicketDetailPage() {
             {ticket.media.length ? (
               <div style={styles.mediaGrid}>
                 {ticket.media.map((media) => (
-                  <a
-                    key={media.id}
-                    href={resolveMediaUrl(media.media_url)}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={styles.mediaLink}
-                  >
-                    <img src={resolveMediaUrl(media.media_url)} alt={`${media.evidence_stage} evidence`} style={styles.mediaImage} />
+                  <SecureMediaLink key={media.id} path={media.media_url} style={styles.mediaLink}>
+                    <SecureMedia
+                      path={media.media_url}
+                      alt={`${media.evidence_stage} evidence`}
+                      style={styles.mediaImage}
+                    />
                     <span>{media.evidence_stage} · {formatDate(media.created_at)}</span>
-                  </a>
+                  </SecureMediaLink>
                 ))}
               </div>
             ) : (
@@ -252,6 +286,19 @@ export default function SupervisorTicketDetailPage() {
                   style={styles.textarea}
                   disabled={busy}
                 />
+                {ticket.status === 'IN_PROGRESS' && (
+                  <label style={styles.fileField}>
+                    <span style={styles.fileLabel}>AFTER photo (required: JPEG, PNG or WebP · max 10 MB)</span>
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      onChange={(event) => setAfterFile(event.target.files?.[0] || null)}
+                      disabled={busy}
+                      style={styles.fileInput}
+                    />
+                    {afterFile && <span style={styles.fileName}>{afterFile.name}</span>}
+                  </label>
+                )}
                 {ticket.status === 'ACKNOWLEDGED' && (
                   <button type="button" style={styles.primary} onClick={start} disabled={busy}>Start work</button>
                 )}
@@ -298,7 +345,7 @@ export default function SupervisorTicketDetailPage() {
                 </div>
               )}
 
-              {['ASSIGNED', 'ACKNOWLEDGED'].includes(ticket.status) && (
+              {['OPEN', 'ASSIGNED', 'ACKNOWLEDGED'].includes(ticket.status) && (
                 <div style={styles.actionGroup}>
                   <select value={groupId} onChange={(e) => setGroupId(e.target.value)} style={styles.input} disabled={busy}>
                     <option value="">Select group</option>
@@ -339,6 +386,7 @@ export default function SupervisorTicketDetailPage() {
                   <strong>{entry.action_type.replaceAll('_', ' ')}</strong>
                   <span style={styles.muted}>
                     {entry.old_value || '—'} → {entry.new_value || '—'} · {formatDate(entry.logged_at)}
+                    {entry.actor_email ? ` · ${entry.actor_email}` : ''}
                   </span>
                   {entry.notes && <span style={styles.notes}>{entry.notes}</span>}
                 </div>
@@ -384,6 +432,10 @@ const styles: Record<string, CSSProperties> = {
   mediaLink: { display: 'flex', flexDirection: 'column', gap: '6px', color: '#94a3b8', fontSize: '12px', textDecoration: 'none' },
   mediaImage: { width: '160px', height: '110px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #334155' },
   actionGroup: { display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '12px', alignItems: 'center' },
+  fileField: { display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px', fontSize: '12px', color: '#94a3b8' },
+  fileLabel: { fontSize: '12px' },
+  fileInput: { color: '#cbd5e1', fontSize: '13px' },
+  fileName: { color: '#4ade80', fontSize: '12px' },
   input: { padding: '10px 12px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#1e293b', color: '#e2e8f0' },
   textarea: { width: '100%', minHeight: '80px', padding: '10px 12px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#1e293b', color: '#e2e8f0', boxSizing: 'border-box', fontFamily: 'inherit' },
   primary: { padding: '10px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#2563eb', color: '#fff', cursor: 'pointer' },

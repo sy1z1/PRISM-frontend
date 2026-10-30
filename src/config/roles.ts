@@ -15,4 +15,10 @@ export const MANAGEMENT_ROLES = [ROLES.COUNCIL_ADMIN, ROLES.SUPER_ADMIN];
 export const isManagementRole = (role?: string | null) =>
   role === ROLES.COUNCIL_ADMIN || role === ROLES.SUPER_ADMIN;
 
+export const isTwinEditorRole = (role?: string | null) =>
+  isManagementRole(role) || role === ROLES.DATA_ENTRY;
+
+export const defaultRouteFor = (role?: string | null) =>
+  isTwinEditorRole(role) ? '/management/dashboard' : '/maintenance/dashboard';
+
 export const getStoredUser = (): StoredUser | null => getStoredAuthUser();
